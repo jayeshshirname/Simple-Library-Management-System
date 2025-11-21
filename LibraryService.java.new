@@ -1,0 +1,280 @@
+package library;
+
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/**
+ * Main service class for the library management system.
+ * Handles books, members, and transactions with thread-safety.
+ */
+public class LibraryService {
+    private final BookDAO bookDao;
+    private final MemberDAO memberDao;
+    private final TransactionDAO txDao;
+    private static final int DEFAULT_LOAN_DAYS = 14;
+    private static final double FINE_PER_DAY = 5.0;
+    private final ReentrantReadWriteLock lock;
+
+    public LibraryService() {
+        this.bookDao = new BookDAO();
+        this.memberDao = new MemberDAO();
+        this.txDao = new TransactionDAO();
+        this.lock = new ReentrantReadWriteLock();
+    }
+
+    /**
+     * Adds a new book to the library.
+     * @param book the book to add
+     * @throws NullPointerException if book is null
+     */
+    public void addBook(Book book) {
+        Objects.requireNonNull(book, "Book cannot be null");
+        lock.writeLock().lock();
+        try {
+            bookDao.add(book);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Lists all books in the library.
+     * @return unmodifiable list of all books
+     */
+    public List<Book> listBooks() {
+        lock.readLock().lock();
+        try {
+            return Collections.unmodifiableList(bookDao.loadAll());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Finds a book by its ID.
+     * @param id the book ID
+     * @return the book or null if not found
+     */
+    public Book findBook(String id) {
+        if (id == null || id.trim().isEmpty()) {
+            return null;
+        }
+        lock.readLock().lock();
+        try {
+            return bookDao.findById(id);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Adds a new member to the library.
+     * @param member the member to add
+     * @throws NullPointerException if member is null
+     */
+    public void addMember(Member member) {
+        Objects.requireNonNull(member, "Member cannot be null");
+        lock.writeLock().lock();
+        try {
+            memberDao.add(member);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Finds a member by their ID.
+     * @param id the member ID
+     * @return the member or null if not found
+     */
+    public Member findMember(String id) {
+        if (id == null || id.trim().isEmpty()) {
+            return null;
+        }
+        lock.readLock().lock();
+        try {
+            return memberDao.findById(id);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Authenticates a member with ID and password.
+     * @param id member ID
+     * @param password member password
+     * @return Optional containing the member if authentication successful
+     */
+    public Optional<Member> authenticate(String id, String password) {
+        if (id == null || password == null) {
+            return Optional.empty();
+        }
+        
+        lock.readLock().lock();
+        try {
+            Member member = memberDao.findById(id);
+            if (member != null && member.checkPassword(password)) {
+                // Upgrade to write lock for update
+                lock.readLock().unlock();
+                lock.writeLock().lock();
+                try {
+                    memberDao.update(member);
+                    return Optional.of(member);
+                } finally {
+                    // Downgrade to read lock
+                    lock.writeLock().unlock();
+                    lock.readLock().lock();
+                }
+            }
+            return Optional.empty();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Issues a book to a member.
+     * @param bookId the book ID
+     * @param memberId the member ID
+     * @return the issue record
+     * @throws IllegalArgumentException if book or member not found or no copies available
+     */
+    public IssueRecord issueBook(String bookId, String memberId) throws IllegalArgumentException {
+        Objects.requireNonNull(bookId, "Book ID cannot be null");
+        Objects.requireNonNull(memberId, "Member ID cannot be null");
+
+        lock.writeLock().lock();
+        try {
+            Book book = bookDao.findById(bookId);
+            if (book == null) {
+                throw new IllegalArgumentException("Book not found: " + bookId);
+            }
+            if (book.getAvailableCopies() <= 0) {
+                throw new IllegalArgumentException("No copies available for book: " + bookId);
+            }
+
+            Member member = memberDao.findById(memberId);
+            if (member == null) {
+                throw new IllegalArgumentException("Member not found: " + memberId);
+            }
+
+            book.setAvailableCopies(book.getAvailableCopies() - 1);
+            bookDao.update(book);
+
+            LocalDate issueDate = LocalDate.now();
+            IssueRecord record = new IssueRecord(
+                UUID.randomUUID().toString(),
+                bookId,
+                memberId,
+                issueDate,
+                issueDate.plusDays(DEFAULT_LOAN_DAYS),
+                null,
+                0.0,
+                "ISSUE"
+            );
+
+            txDao.append(record, issueDate);
+            return record;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Returns a book and calculates any fines.
+     * @param txId the transaction ID
+     * @param bookId the book ID
+     * @param memberId the member ID
+     * @return the return record
+     * @throws IllegalArgumentException if book, member, or transaction not found
+     */
+    public IssueRecord returnBook(String txId, String bookId, String memberId) throws IllegalArgumentException {
+        Objects.requireNonNull(txId, "Transaction ID cannot be null");
+        Objects.requireNonNull(bookId, "Book ID cannot be null");
+        Objects.requireNonNull(memberId, "Member ID cannot be null");
+
+        lock.writeLock().lock();
+        try {
+            Book book = bookDao.findById(bookId);
+            if (book == null) {
+                throw new IllegalArgumentException("Book not found: " + bookId);
+            }
+
+            Member member = memberDao.findById(memberId);
+            if (member == null) {
+                throw new IllegalArgumentException("Member not found: " + memberId);
+            }
+
+            LocalDate returnDate = LocalDate.now();
+            List<IssueRecord> transactions = txDao.loadForDate(returnDate);
+            IssueRecord original = transactions.stream()
+                .filter(r -> r.getId().equals(txId) && "ISSUE".equalsIgnoreCase(r.getAction()))
+                .findFirst()
+                .orElse(null);
+
+            LocalDate dueDate;
+            if (original != null) {
+                dueDate = original.getDueDate();
+            } else if (!transactions.isEmpty()) {
+                dueDate = transactions.get(0).getDueDate();
+            } else {
+                dueDate = returnDate; // No fine if original record not found
+            }
+
+            long daysLate = returnDate.toEpochDay() - dueDate.toEpochDay();
+            double fine = Math.max(0, daysLate * FINE_PER_DAY);
+
+            book.setAvailableCopies(book.getAvailableCopies() + 1);
+            bookDao.update(book);
+
+            IssueRecord returnRecord = new IssueRecord(
+                txId,
+                bookId,
+                memberId,
+                null,
+                dueDate,
+                returnDate,
+                fine,
+                "RETURN"
+            );
+
+            txDao.append(returnRecord, returnDate);
+            return returnRecord;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Counts the number of issues on a specific date.
+     * @param date the date to count issues for
+     * @return the number of issues
+     */
+    public long countIssuesOn(LocalDate date) {
+        Objects.requireNonNull(date, "Date cannot be null");
+        lock.readLock().lock();
+        try {
+            return txDao.loadForDate(date).stream()
+                .filter(r -> "ISSUE".equalsIgnoreCase(r.getAction()))
+                .count();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Lists all transactions for a specific date.
+     * @param date the date to list transactions for
+     * @return unmodifiable list of transactions
+     */
+    public List<IssueRecord> listTransactions(LocalDate date) {
+        Objects.requireNonNull(date, "Date cannot be null");
+        lock.readLock().lock();
+        try {
+            return Collections.unmodifiableList(txDao.loadForDate(date));
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+}
